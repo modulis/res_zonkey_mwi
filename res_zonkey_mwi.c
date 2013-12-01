@@ -38,15 +38,15 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: $")
 #include "asterisk/event.h"
 
 #ifndef AST_MODULE
-#define AST_MODULE "res_zonkey_mwi"
+#define AST_MODULE        "res_zonkey_mwi"
 #endif
 
-#define REALTIME_FAMILY "zonkeymwi"
-#define LEN_MWI_USER 32
-#define LEN_MWI_DOMAIN 128
-#define LEN_MWI_TOTAG 256
-#define LEN_MWI_FROMTAG 256
-#define LEN_MWI_CALLID 256
+#define REALTIME_FAMILY   "zonkeymwi"
+#define LEN_MWI_USER      32
+#define LEN_MWI_DOMAIN    128
+#define LEN_MWI_TOTAG     256
+#define LEN_MWI_FROMTAG   256
+#define LEN_MWI_CALLID    256
 
 unsigned int realtime_enabled= 0;       // flag status of realtime configuration detected
 struct ast_event_sub *mwi_sub = NULL;   // Subscribe to MWI event
@@ -73,11 +73,9 @@ static char *handle_cli_zonkeymwi_status(struct ast_cli_entry *e, int cmd, struc
 static char *handle_cli_zonkeymwi_show_subscription(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static struct subscription *find_watcher(char *name, char *domain);
 
-static char show_mwi(int fd);
-
 static struct ast_cli_entry cli_zonkeymwi[] = {
-  AST_CLI_DEFINE(handle_cli_zonkeymwi_status,       "Show Zonkey MWI status"),
-  AST_CLI_DEFINE(handle_cli_zonkeymwi_show_subscription,       "Show MWI subscription for user in domain")
+  AST_CLI_DEFINE(handle_cli_zonkeymwi_status,             "Show Zonkey MWI status"),
+  AST_CLI_DEFINE(handle_cli_zonkeymwi_show_subscription,  "Show MWI subscription for user in domain")
 };
 
 /*!
@@ -210,8 +208,6 @@ static char *handle_cli_zonkeymwi_status(struct ast_cli_entry *e, int cmd, struc
   if(!realtime_enabled) {
     ast_cli(a->fd, "    To enable module configure realtime family zonkey and driver\n");
     ast_cli(a->fd, "    For example: zonkeymwi => odbc,opensips,active_watchers\n");
-  }else{
-    return show_mwi(a->fd);
   }
 
   return CLI_SUCCESS;
@@ -225,33 +221,59 @@ static char *handle_cli_zonkeymwi_status(struct ast_cli_entry *e, int cmd, struc
 static struct subscription *find_watcher(char *name, char *domain)
 {
   struct subscription *sub = malloc(sizeof(struct subscription));
-  const char tmp[] = "aaa";
-  ast_copy_string(sub->name, name, sizeof(sub->name));
-  ast_copy_string(sub->domain, domain, sizeof(sub->domain));
-  ast_copy_string(sub->to_tag, tmp, sizeof(sub->to_tag));
-  ast_copy_string(sub->from_tag, tmp, sizeof(sub->from_tag));
-  ast_copy_string(sub->callid, tmp, sizeof(sub->callid));
-  sub->expires = 1213;
-  sub->cseq = 12;
+  char *rec = NULL;
+  struct ast_config *cfg;
 
+  /* There can be more then one subscription for MWI in the 
+   * table. When subscriber sends re-SUBSCRIBE for subscription
+   * that will expire. Usualy 10 seconds before expire time.
+   * So we need to select the latest subscription.
+   *
+   * So far I did not found how to select records with realtime
+   * ordered by expire fild. That wy we browse them all and 
+   * get the latest. It should not be a problem as usually 
+   * there are maximum two message-summary records.
+   */
+  if (!(cfg = ast_load_realtime_multientry(REALTIME_FAMILY,
+          "event", "message-summary",
+          "watcher_username", name,
+          "watcher_domain", domain, SENTINEL))){
+    free(sub);
+    return NULL;
+  }
+
+  // set initial expire
+  sub->expires = 0;
+  // browse records
+  while ((rec = ast_category_browse(cfg, rec))) {
+    struct ast_variable *var = NULL;
+    struct subscription *tmp = malloc(sizeof(struct subscription));
+
+    ast_copy_string(tmp->name, name, sizeof(tmp->name));
+    ast_copy_string(tmp->domain, domain, sizeof(tmp->domain));
+    for (var = ast_variable_browse(cfg, rec); var; var = var->next){
+      if(!strcasecmp(var->name, "to_tag")){
+        ast_copy_string(tmp->to_tag, var->value, sizeof(tmp->to_tag));
+      }else if(!strcasecmp(var->name, "from_tag")) {
+        ast_copy_string(tmp->from_tag, var->value, sizeof(tmp->from_tag));
+      }else if(!strcasecmp(var->name, "callid")) {
+        ast_copy_string(tmp->callid, var->value, sizeof(tmp->callid));
+      }else if(!strcasecmp(var->name, "expires")) {
+        tmp->expires = atoi(var->value);
+      }else if(!strcasecmp(var->name, "local_cseq")) {
+        tmp->cseq = atoi(var->value);
+      }
+    }
+    // swap pointers if current expire timestamp is bigger then sub
+    if(sub->expires < tmp->expires){
+      *sub= *tmp;
+    }
+    ast_variables_destroy(var);
+    free(tmp);
+  }
+
+  ast_config_destroy(cfg);
   return sub;
-}
-
-static char show_mwi(int fd)
-{
-  struct ast_variable *var, *el =  NULL;
-
-  if (!(var = ast_load_realtime(REALTIME_FAMILY,"event","message-summary", "expires DESC",SENTINEL))){
-    ast_cli(fd, "\n====> Failed ast_load_realtime\n");
-    return CLI_FAILURE;
-  }
-  ast_cli(fd, "\n================= Presence ==================\n");
-  for(el = var; el; el=el->next){
-    ast_cli(fd, "=== ==> %s: %s\n", el->name, el->value);
-  }
-  ast_variables_destroy(var);
-  ast_variables_destroy(el);
-  return CLI_SUCCESS;
 }
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "Zonkey MWI module",
