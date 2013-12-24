@@ -34,6 +34,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: $")
 #include "asterisk/module.h"
 #include "asterisk/logger.h"
 #include "asterisk/config.h"
+#include "asterisk/config_options.h"
 #include "asterisk/cli.h"
 #include "asterisk/event.h"
 #include "asterisk/strings.h"
@@ -50,10 +51,55 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: $")
 #define LEN_MWI_TOTAG     256
 #define LEN_MWI_FROMTAG   256
 #define LEN_MWI_CALLID    256
-#define LEN_MWI_SIPMSG    4096 // same length chan_sip.c uses
+#define LEN_MWI_SIPMSG    4096                  // same length chan_sip.c uses
+#define DEFAULT_USERAGENT "Asterisk"            // default User-Agent value if not defined in config file
+#define DEFAULT_CONTACTUSER "asterisk"          // default user part of Contact header URI
+#define DEFAULT_BINDUP    "127.0.0.1"           // default bind IP, used in Contact and Via header
+#define DEFAULT_VMEXTEN   "*97"                 // default user part of Message-Account header
+#define DEFAULT_SIPPORT   "5060"                // default SIP transport port
 
 unsigned int realtime_enabled= 0;       // flag status of realtime configuration detected
 struct ast_event_sub *mwi_sub = NULL;   // Subscribe to MWI event
+ 
+/*! \brief The global options available for this module */
+ struct global_options {
+   /*! destination outbound proxy. Usualy OpenSIPS server. host:port */
+   char proxy[128];
+   /*! Bind IP to use in Contact and Via headers */
+   char bindip[128];
+   /*! User-Agent header value */
+   char useragent[32];
+   /*! user part of Contact header URI */
+   char contactuser[32];
+   /* Message-Account body header user part of URI */
+   char vmexten[32];
+ };
+
+/*! \brief All configuration objects for this module */
+struct module_config {
+  struct global_options *general; /*< Our global settings */
+};
+
+/*! \brief A container that holds our global module configuration */
+static AO2_GLOBAL_OBJ_STATIC(module_configs);
+
+/*! \brief A mapping of the module_config struct's general settings to the context
+ *         in the configuration file that will populate its values */
+static struct aco_type general_option = {
+  .type = ACO_GLOBAL,
+  .item_offset = offsetof(struct module_config, general),
+  .category = "^general$",
+  .category_match = ACO_WHITELIST,
+};
+ 
+/*! \brief A configuration file that will be processed for the module */
+static struct aco_file module_conf = {
+  .filename = "zonkeymwi.conf",
+  .types = ACO_TYPES(&general_option),
+};
+ 
+static struct aco_type *general_options[] = ACO_TYPES(&general_option);
+
 /*! \brief Active MWI subscriber data */
 struct subscription {
   /*! User name */
@@ -72,19 +118,28 @@ struct subscription {
   unsigned int cseq;
 };
 
+static void *module_config_alloc(void);
+static void module_config_destructor(void *obj);
 static void zonkey_mwi_cb(const struct ast_event *ast_event, void *data);
 static char *handle_cli_zonkeymwi_status(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_zonkeymwi_show_subscription(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_zonkeymwi_notify(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_zonkeymwi_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static struct subscription *find_watcher(char *name, char *domain);
 int send_notify(struct subscription *watcher, int msgnew, int msgold, struct ast_cli_args *a);
 void notify_create(struct ast_str *msg, struct subscription *watcher, int new, int old);
+static void log_module_values(void);
 
 static struct ast_cli_entry cli_zonkeymwi[] = {
   AST_CLI_DEFINE(handle_cli_zonkeymwi_status,             "Show Zonkey MWI status"),
   AST_CLI_DEFINE(handle_cli_zonkeymwi_show_subscription,  "Show MWI subscription for user in domain"),
-  AST_CLI_DEFINE(handle_cli_zonkeymwi_notify,  "Send NOTIFY MWI to user in domain with defined messages number")
+  AST_CLI_DEFINE(handle_cli_zonkeymwi_reload,             "Reload module configuration"),
+  AST_CLI_DEFINE(handle_cli_zonkeymwi_notify,             "Send NOTIFY MWI to user in domain with defined messages number")
 };
+
+CONFIG_INFO_STANDARD(cfg_info, module_configs, module_config_alloc,
+  .files = ACO_FILES(&module_conf),
+);
 
 /*!
  * \internal
@@ -93,12 +148,27 @@ static struct ast_cli_entry cli_zonkeymwi[] = {
  */
 static int load_module(void)
 {
-  int res = 0;
   // subscribe to MWI event
   mwi_sub = ast_event_subscribe(AST_EVENT_MWI, zonkey_mwi_cb, "Zonkey MWI module", NULL, AST_EVENT_IE_END);
   // register CLI 
   ast_cli_register_multiple(cli_zonkeymwi, ARRAY_LEN(cli_zonkeymwi));
-  return res;
+  // module configuration
+  if (aco_info_init(&cfg_info)) {
+    aco_info_destroy(&cfg_info);
+    return AST_MODULE_LOAD_DECLINE;
+  }
+  aco_option_register(&cfg_info, "proxy", ACO_EXACT, general_options, NULL, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct global_options, proxy));
+  aco_option_register(&cfg_info, "bindip", ACO_EXACT, general_options, DEFAULT_BINDUP, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct global_options, bindip));
+  aco_option_register(&cfg_info, "useragent", ACO_EXACT, general_options, DEFAULT_USERAGENT, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct global_options, useragent));
+  aco_option_register(&cfg_info, "contactuser", ACO_EXACT, general_options, DEFAULT_CONTACTUSER, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct global_options, contactuser));
+  aco_option_register(&cfg_info, "vmexten", ACO_EXACT, general_options, DEFAULT_VMEXTEN, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct global_options, vmexten));
+
+  if (aco_process_config(&cfg_info, 0)) {
+    aco_info_destroy(&cfg_info);
+    return AST_MODULE_LOAD_DECLINE;
+  }
+  log_module_values();
+  return AST_MODULE_LOAD_SUCCESS;
 }
 
 /*!
@@ -108,16 +178,31 @@ static int load_module(void)
  */
 static int unload_module(void)
 {
-  int res = 0;
   if(mwi_sub){
     ast_event_unsubscribe(mwi_sub);
   }
   // unregister CLI
   ast_cli_unregister_multiple(cli_zonkeymwi, ARRAY_LEN(cli_zonkeymwi));
+  // unload configuration
+  aco_info_destroy(&cfg_info);
 
-  return res;
+  return 0;
 }
 
+/*! \internal \brief reload handler
+ * \retval AST_MODULE_LOAD_SUCCESS on success
+ * \retval AST_MODULE_LOAD_DECLINE on failure
+ */
+ 
+static int reload_module(void)
+{
+  if (aco_process_config(&cfg_info, 1)) {
+    return AST_MODULE_LOAD_DECLINE;
+  }
+
+  return 0;
+}
+  
 /*!
  * \brief Callback function for MWI event
  * \param ast_event
@@ -222,6 +307,35 @@ static char *handle_cli_zonkeymwi_status(struct ast_cli_entry *e, int cmd, struc
 }
 
 /*!
+ * \brief Reload module configuration
+ * \param ast_cli_entry
+ * \param command
+ * \param command arguments
+ * \return char
+ */
+static char *handle_cli_zonkeymwi_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+  switch (cmd) {
+  case CLI_INIT:
+    e->command = "zonkeymwi reload";
+    e->usage =
+      "Usage: zonkeymwi reload\n"
+      "       Reload module configuration\n"
+      "\n";
+    return NULL;
+  case CLI_GENERATE:
+    return NULL;
+  }
+
+  if (aco_process_config(&cfg_info, 1) == ACO_PROCESS_ERROR) {
+    ast_verb(0, "Error while reloading module configuration");
+    return CLI_FAILURE;
+  }
+  log_module_values();
+  return CLI_SUCCESS;
+}
+
+/*!
  * \brief Send NOTIFY MWI event to given user@domain with given number of messages.
  * \param ast_cli_entry
  * \param command
@@ -278,17 +392,6 @@ static char *handle_cli_zonkeymwi_notify(struct ast_cli_entry *e, int cmd, struc
  */
 int send_notify(struct subscription *watcher, int msgnew, int msgold, struct ast_cli_args *a)
 {
-  /*
-  ast_cli(a->fd, "MWI subscription details for %s@%s:\n", watcher->name, watcher->domain);
-  ast_cli(a->fd, "  To tag:   %s\n", watcher->to_tag);
-  ast_cli(a->fd, "  From tag: %s\n", watcher->from_tag);
-  ast_cli(a->fd, "  Call-ID:  %s\n", watcher->callid);
-  ast_cli(a->fd, "  Expires:  %d\n", watcher->expires);
-  ast_cli(a->fd, "  CSeq:     %d\n", watcher->cseq);
-  ast_cli(a->fd, "\n");
-  ast_cli(a->fd, "---- Waiting-Messages: %d\n", msgnum);
-  return 0;
-  */
   struct ast_str *msg = ast_str_create(LEN_MWI_SIPMSG);
   notify_create(msg, watcher, msgnew, msgold);
   ast_cli(a->fd, "<------------------>\n%s\n<------------------>\n", ast_str_buffer(msg));
@@ -306,8 +409,7 @@ int send_notify(struct subscription *watcher, int msgnew, int msgold, struct ast
  */
 void notify_create(struct ast_str *msg, struct subscription *watcher, int new, int old)
 {
-  const char bindip[] = "pbx01.clusterpbx.ca";
-  const char contact[] = "asterisk";
+  RAII_VAR(struct module_config *, cfg, ao2_global_obj_ref(module_configs), ao2_cleanup);
   // Date field
   char date[256];
   struct tm tm;
@@ -325,13 +427,14 @@ void notify_create(struct ast_str *msg, struct subscription *watcher, int new, i
 
   // NOTIFY message constructing
   ast_str_set(&msg, 0, "NOTIFY sip:%s@%s SIP/2.0\r\n", watcher->name, watcher->domain);
-  ast_str_append(&msg, 0, "Via: %s;branch=z9hG4bK%08lx\r\n", bindip, ast_random());
+  ast_str_append(&msg, 0, "Via: SIP/2.0/UDP %s;branch=z9hG4bK%08lx\r\n", cfg->general->bindip, ast_random());
   ast_str_append(&msg, 0, "To: sip:%s@%s;tag=%s\r\n", watcher->name, watcher->domain, watcher->to_tag);
   ast_str_append(&msg, 0, "From: sip:%s@%s;tag=%s\r\n", watcher->name, watcher->domain, watcher->from_tag);
   ast_str_append(&msg, 0, "Date: %s\r\n", date);
   ast_str_append(&msg, 0, "Call-id: %s\r\n", watcher->callid);
   ast_str_append(&msg, 0, "CSeq: %d NOTIFY\r\n", watcher->cseq + 1);
-  ast_str_append(&msg, 0, "Contact: <%s@%s>\r\n", contact, bindip);
+  ast_str_append(&msg, 0, "Contact: <sip:%s@%s>\r\n", cfg->general->contactuser, cfg->general->bindip);
+  ast_str_append(&msg, 0, "User-Agent: %s\r\n", cfg->general->useragent);
   ast_str_append(&msg, 0, "Event: message-summary\r\n");
   ast_str_append(&msg, 0, "Subscription-State: active\r\n");
   ast_str_append(&msg, 0, "Content-Type: application/simple-message-summary\r\n");
@@ -405,7 +508,53 @@ static struct subscription *find_watcher(char *name, char *domain)
   return sub;
 }
 
+/*! Module configuration helper functions */
+
+/*! \internal \brief Create a module_config object */
+static void *module_config_alloc(void)
+{
+  struct module_config *cfg;
+
+  if (!(cfg = ao2_alloc(sizeof(*cfg), module_config_destructor))) {
+    return NULL;
+  }
+  if (!(cfg->general = ao2_alloc(sizeof(*cfg->general), NULL))) {
+    ao2_ref(cfg, -1);
+    return NULL;
+  }
+
+  return cfg;
+}
+ 
+/*! \internal \brief Dispose of a module_config object */
+static void module_config_destructor(void *obj)
+{
+  struct module_config *cfg = obj;
+  ao2_cleanup(cfg->general);
+}
+  
+/*! \internal \brief Log the current module values */
+static void log_module_values(void)
+{
+  RAII_VAR(struct module_config *, cfg, ao2_global_obj_ref(module_configs), ao2_cleanup);
+
+  if (!cfg || !cfg->general) {
+    ast_log(LOG_ERROR, "ERROR: Can not load configuration");
+    return;
+  }
+
+  /* Assume that something will call this function */
+  ast_verb(0, "Module values: proxy=%s; bindip=%s, useragent=%s; contactuser=%s; vmexten=%s\n",
+  cfg->general->proxy,
+  cfg->general->bindip,
+  cfg->general->useragent,
+  cfg->general->contactuser,
+  cfg->general->vmexten);
+}
+
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, "Zonkey MWI module",
-    .load = load_module,
-    .unload = unload_module
-  );
+  .load = load_module,
+  .unload = unload_module,
+  .reload = reload_module,
+  .load_pri = AST_MODPRI_DEFAULT,
+);
