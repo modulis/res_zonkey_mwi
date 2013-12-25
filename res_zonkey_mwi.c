@@ -56,7 +56,6 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: $")
 #define DEFAULT_CONTACTUSER "asterisk"          // default user part of Contact header URI
 #define DEFAULT_BINDUP    "127.0.0.1"           // default bind IP, used in Contact and Via header
 #define DEFAULT_VMEXTEN   "*97"                 // default user part of Message-Account header
-#define DEFAULT_SIPPORT   "5060"                // default SIP transport port
 
 unsigned int realtime_enabled= 0;       // flag status of realtime configuration detected
 struct ast_event_sub *mwi_sub = NULL;   // Subscribe to MWI event
@@ -71,7 +70,7 @@ struct ast_event_sub *mwi_sub = NULL;   // Subscribe to MWI event
    char useragent[32];
    /*! user part of Contact header URI */
    char contactuser[32];
-   /* Message-Account body header user part of URI */
+   /*! Message-Account body header user part of URI */
    char vmexten[32];
  };
 
@@ -126,7 +125,7 @@ static char *handle_cli_zonkeymwi_show_subscription(struct ast_cli_entry *e, int
 static char *handle_cli_zonkeymwi_notify(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_zonkeymwi_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static struct subscription *find_watcher(char *name, char *domain);
-int send_notify(struct subscription *watcher, int msgnew, int msgold, struct ast_cli_args *a);
+int send_notify(struct subscription *watcher, int msgnew, int msgold);
 void notify_create(struct ast_str *msg, struct subscription *watcher, int new, int old);
 static void log_module_values(void);
 
@@ -211,20 +210,30 @@ static int reload_module(void)
  */
 static void zonkey_mwi_cb(const struct ast_event *ast_event, void *data)
 {
-  const char *mailbox;
-  const char *context;
-  char oldmsgs[10];
-  char newmsgs[10];
+  char user[LEN_MWI_USER];
+  char domain[LEN_MWI_DOMAIN];
+  unsigned int  msgnew = 0, msgold = 0;
+
+  RAII_VAR(struct subscription *, watcher, NULL, ast_free);
 
   ast_log(LOG_DEBUG, "Voicemail event got. Zonkey is going to notify OpenSIPS\n");
 
-  mailbox = ast_event_get_ie_str(ast_event, AST_EVENT_IE_MAILBOX);
-  context = ast_event_get_ie_str(ast_event, AST_EVENT_IE_CONTEXT);
-  snprintf(newmsgs, sizeof(newmsgs), "%d", ast_event_get_ie_uint(ast_event, AST_EVENT_IE_NEWMSGS));
-  snprintf(oldmsgs, sizeof(oldmsgs), "%d", ast_event_get_ie_uint(ast_event, AST_EVENT_IE_OLDMSGS));
+  ast_copy_string(user, ast_event_get_ie_str(ast_event, AST_EVENT_IE_MAILBOX), sizeof(user));
+  ast_copy_string(domain, ast_event_get_ie_str(ast_event, AST_EVENT_IE_CONTEXT), sizeof(domain));
+  msgnew = ast_event_get_ie_uint(ast_event, AST_EVENT_IE_NEWMSGS);
+  msgold = ast_event_get_ie_uint(ast_event, AST_EVENT_IE_OLDMSGS);
 
-  ast_log(LOG_DEBUG, "MWI DATA:\nMailbox: %s\nContext: %s\nNew messages: %s\nOld messages: %s\n",
-      mailbox, context, newmsgs, oldmsgs);
+  ast_log(LOG_DEBUG, "Mailbox: %s; Context: %s; New messages: %d; Old messages: %d\n",
+      user, domain, msgnew, msgold);
+  if((watcher=find_watcher(user, domain)) == NULL){
+    ast_log(LOG_ERROR, "No subscription found for %s@%s\n", user, domain);
+    return;
+  }
+  if(send_notify(watcher, msgnew, msgold)){
+    ast_log(LOG_DEBUG, "Successfully sent NOTIFY for %s@%s\n", user, domain);
+  }else{
+    ast_log(LOG_ERROR, "Failed to sent NOTIFY for %s@%s\n", user, domain);
+  }
 }
 
 /*!
@@ -236,9 +245,10 @@ static void zonkey_mwi_cb(const struct ast_event *ast_event, void *data)
  */
 static char *handle_cli_zonkeymwi_show_subscription(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
-  struct subscription *watcher;
   char user[LEN_MWI_USER];
   char domain[LEN_MWI_DOMAIN];
+
+  RAII_VAR(struct subscription *, watcher, NULL, ast_free);
 
   switch (cmd) {
   case CLI_INIT:
@@ -271,7 +281,6 @@ static char *handle_cli_zonkeymwi_show_subscription(struct ast_cli_entry *e, int
   }else{
     ast_cli(a->fd, "   Currently no valid MWI subscription found for %s@%s\n",user,domain);
   }
-  free(watcher);
   return CLI_SUCCESS;
 }
 
@@ -328,7 +337,7 @@ static char *handle_cli_zonkeymwi_reload(struct ast_cli_entry *e, int cmd, struc
   }
 
   if (aco_process_config(&cfg_info, 1) == ACO_PROCESS_ERROR) {
-    ast_verb(0, "Error while reloading module configuration");
+    ast_log(LOG_DEBUG, "Error while reloading module configuration");
     return CLI_FAILURE;
   }
   log_module_values();
@@ -344,10 +353,11 @@ static char *handle_cli_zonkeymwi_reload(struct ast_cli_entry *e, int cmd, struc
  */
 static char *handle_cli_zonkeymwi_notify(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
-  struct subscription *watcher;
   char user[LEN_MWI_USER];
   char domain[LEN_MWI_DOMAIN];
   int  msgnew = 0, msgold = 0;
+
+  RAII_VAR(struct subscription *, watcher, NULL, ast_free);
 
   switch (cmd) {
   case CLI_INIT:
@@ -376,7 +386,7 @@ static char *handle_cli_zonkeymwi_notify(struct ast_cli_entry *e, int cmd, struc
     return CLI_SUCCESS;
   }
   
-  if(send_notify(watcher, msgnew, msgold, a)){
+  if(send_notify(watcher, msgnew, msgold)){
     ast_cli(a->fd, "Notify %s@%s with %d new messages and %d old messages was sent\n", user, domain, msgnew, msgold);
   }
 
@@ -387,16 +397,40 @@ static char *handle_cli_zonkeymwi_notify(struct ast_cli_entry *e, int cmd, struc
  * \brief Generate and send SIP NOTIFY request
  * \param watcher struct
  * \param number of waiting messages
- * \param command arguments
  * \return int
  */
-int send_notify(struct subscription *watcher, int msgnew, int msgold, struct ast_cli_args *a)
+int send_notify(struct subscription *watcher, int msgnew, int msgold)
 {
   struct ast_str *msg = ast_str_create(LEN_MWI_SIPMSG);
+  RAII_VAR(struct ast_sockaddr *, addr, NULL, ast_free);
+  RAII_VAR(struct module_config *, cfg, ao2_global_obj_ref(module_configs), ao2_cleanup);
+  int num_addrs = 0, sock = -1, res = 0;
+
+  if (!(num_addrs = ast_sockaddr_resolve(&addr, cfg->general->proxy, PARSE_PORT_REQUIRE, AST_AF_UNSPEC))) {
+    ast_log(LOG_ERROR, "Failed to create destination address from proxy %s. "
+                "Make sure proxy parameter is a valid IP/Domain and Port\n",
+                cfg->general->proxy);
+    goto ensure;
+  }
+  if((sock = socket(addr->ss.ss_family, SOCK_DGRAM, 0)) == -1){
+    ast_log(LOG_ERROR, "Failed to create socket. Give up here!");
+    goto ensure;
+  }
   notify_create(msg, watcher, msgnew, msgold);
-  ast_cli(a->fd, "<------------------>\n%s\n<------------------>\n", ast_str_buffer(msg));
+  ast_log(LOG_DEBUG, "<------------------>\n%s\n<------------------>\n", ast_str_buffer(msg));
+
+  if(ast_sendto(sock, ast_str_buffer(msg), ast_str_strlen(msg), 0, addr) == -1){
+    ast_log(LOG_ERROR, "Failed to send notify!");
+    goto ensure;
+  }
+
+  // everything is fine
+  res = 1;
+
+ensure:
+  close(sock);
   ast_free(msg);
-  return 1;
+  return res;
 }
 
 /*!
@@ -544,7 +578,7 @@ static void log_module_values(void)
   }
 
   /* Assume that something will call this function */
-  ast_verb(0, "Module values: proxy=%s; bindip=%s, useragent=%s; contactuser=%s; vmexten=%s\n",
+  ast_log(LOG_DEBUG, "Module values: proxy=%s; bindip=%s, useragent=%s; contactuser=%s; vmexten=%s\n",
   cfg->general->proxy,
   cfg->general->bindip,
   cfg->general->useragent,
