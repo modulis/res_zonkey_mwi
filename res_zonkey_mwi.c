@@ -74,6 +74,9 @@ struct ast_event_sub *mwi_sub = NULL;   // Subscribe to MWI event
    char vmexten[32];
  };
 
+/*! \brief Debug on/off */
+static int debug=0;
+
 /*! \brief All configuration objects for this module */
 struct module_config {
   struct global_options *general; /*< Our global settings */
@@ -124,6 +127,7 @@ static char *handle_cli_zonkeymwi_status(struct ast_cli_entry *e, int cmd, struc
 static char *handle_cli_zonkeymwi_show_subscription(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_zonkeymwi_notify(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_zonkeymwi_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_zonkeymwi_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static struct subscription *find_watcher(char *name, char *domain);
 int send_notify(struct subscription *watcher, int msgnew, int msgold);
 void notify_create(struct ast_str *msg, struct subscription *watcher, int new, int old);
@@ -133,7 +137,8 @@ static struct ast_cli_entry cli_zonkeymwi[] = {
   AST_CLI_DEFINE(handle_cli_zonkeymwi_status,             "Show Zonkey MWI status"),
   AST_CLI_DEFINE(handle_cli_zonkeymwi_show_subscription,  "Show MWI subscription for user in domain"),
   AST_CLI_DEFINE(handle_cli_zonkeymwi_reload,             "Reload module configuration"),
-  AST_CLI_DEFINE(handle_cli_zonkeymwi_notify,             "Send NOTIFY MWI to user in domain with defined messages number")
+  AST_CLI_DEFINE(handle_cli_zonkeymwi_notify,             "Send NOTIFY MWI to user in domain with defined messages number"),
+  AST_CLI_DEFINE(handle_cli_zonkeymwi_debug,              "Debug NOTIFY packet on/off")
 };
 
 CONFIG_INFO_STANDARD(cfg_info, module_configs, module_config_alloc,
@@ -285,6 +290,45 @@ static char *handle_cli_zonkeymwi_show_subscription(struct ast_cli_entry *e, int
 }
 
 /*!
+ * \brief Debug on/off
+ * \param ast_cli_entry
+ * \param command
+ * \param command arguments
+ * \return char
+ */
+static char *handle_cli_zonkeymwi_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+  switch (cmd) {
+  case CLI_INIT:
+    e->command = "zonkeymwi debug";
+    e->usage =
+      "Usage: zonkeymwi debug on|off\n"
+      "       Debug output on/off\n"
+      "\n";
+    return NULL;
+  case CLI_GENERATE:
+    return NULL;
+  }
+  if(a->argc != 3) {
+    ast_cli(a->fd, "Wrong number of arguments.\n");
+    return CLI_SHOWUSAGE;
+  }
+  if(ast_true(a->argv[2])){
+    debug = 1;
+    ast_cli(a->fd, "Debug enabled.\n");
+  }else if(ast_false(a->argv[2])){
+    debug = 0;
+    ast_cli(a->fd, "Debug disabled.\n");
+  }else{
+    ast_cli(a->fd, "Unknown argument '%s'.\n", a->argv[2]);
+    return CLI_SHOWUSAGE;
+  }
+
+  return CLI_SUCCESS;
+}
+
+
+/*!
  * \brief CLI zonkeymwi status
  * \param ast_cli_entry
  * \param command
@@ -417,7 +461,8 @@ int send_notify(struct subscription *watcher, int msgnew, int msgold)
     goto ensure;
   }
   notify_create(msg, watcher, msgnew, msgold);
-  ast_log(LOG_DEBUG, "<------------------>\n%s\n<------------------>\n", ast_str_buffer(msg));
+  if(debug)
+    ast_verb(0, "\nDEBUG------------------>\n%s\nDEBUG<------------------\n", ast_str_buffer(msg));
 
   if(ast_sendto(sock, ast_str_buffer(msg), ast_str_strlen(msg), 0, addr) == -1){
     ast_log(LOG_ERROR, "Failed to send notify!");
