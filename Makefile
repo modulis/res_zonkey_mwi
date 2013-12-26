@@ -27,6 +27,10 @@ OBJECTS=res_zonkey_mwi.o
 
 SHAREDOS=res_zonkey_mwi.so
 
+CONFDIR=/etc/asterisk
+
+CONFFILE=zonkeymwi.conf
+
 all: res_zonkey_mwi.o res_zonkey_mwi.so
 
 res_zonkey_mwi.o: res_zonkey_mwi.c
@@ -37,6 +41,7 @@ res_zonkey_mwi.so: res_zonkey_mwi.o
 
 install: all
 	$(INSTALL) -m 755 res_zonkey_mwi.so /usr/lib/asterisk/modules/
+	[ ! -f $(CONFDIR)/$(CONFFILE) ] && $(INSTALL) -m 755 $(CONFFILE) $(CONFDIR)/$(CONFFILE) || :
 
 reinstall: clean all install
 
