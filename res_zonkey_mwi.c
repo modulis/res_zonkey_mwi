@@ -498,10 +498,9 @@ void notify_create(struct ast_str *msg, struct subscription *watcher, int new, i
 
   // message body
   struct ast_str *body = ast_str_create(LEN_MWI_SIPMSG);
-  char vmexten[] = "*97";
 
   ast_str_set(&body, 0, "Messages-Waiting: %s\r\n", new ? "yes": "no");
-  ast_str_append(&body, 0, "Message-Account: sip:%s@%s\r\n", vmexten, watcher->domain);
+  ast_str_append(&body, 0, "Message-Account: sip:%s@%s\r\n", cfg->general->vmexten, watcher->domain);
   ast_str_append(&body, 0, "Voice-Message: %d/%d (%d/%d)\r\n", new, old, 0, 0);
 
   // NOTIFY message constructing
